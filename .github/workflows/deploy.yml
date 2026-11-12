@@ -1,0 +1,46 @@
+name: Deploy to Hugging Face
+
+# Every push to main publishes the service to a Hugging Face Space.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Spaces read their settings from a YAML block at the top of README.md.
+      # Add it only for the Space, so the GitHub README stays clean.
+      - name: Add Space metadata
+        run: |
+          {
+            echo "---"
+            echo "title: Gardrop AI"
+            echo "emoji: 👗"
+            echo "colorFrom: gray"
+            echo "colorTo: red"
+            echo "sdk: docker"
+            echo "app_port: 7860"
+            echo "pinned: false"
+            echo "license: mit"
+            echo "---"
+            echo
+            cat README.md
+          } > README.space.md
+          mv README.space.md README.md
+
+      # Push a single fresh commit; the Space doesn't need the Git history.
+      - name: Push to the Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_USERNAME: ${{ vars.HF_USERNAME }}
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git checkout --orphan space
+          git add -A
+          git commit -m "Deploy ${GITHUB_SHA::7}"
+          git push --force "https://${HF_USERNAME}:${HF_TOKEN}@huggingface.co/spaces/${HF_USERNAME}/gardrop-ai" space:main

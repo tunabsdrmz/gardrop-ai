@@ -9,7 +9,7 @@ from PIL import Image
 from app.config import Settings, get_settings
 from app.main import app
 from app.services.embedder import get_embedder
-from app.services.stylist import get_anthropic_client
+from app.services.stylist import get_stylist
 
 
 class FakeEmbedder:
@@ -58,6 +58,28 @@ def reply(*blocks, stop_reason="end_turn"):
     return SimpleNamespace(content=list(blocks), stop_reason=stop_reason)
 
 
+class FakeOpenAI:
+    """Same idea for OpenAI-compatible APIs (Ollama, Groq, Gemini)."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        self.calls.append({**kwargs, "messages": list(kwargs["messages"])})
+        return self.responses.pop(0)
+
+
+def chat_reply(content=None, tool_calls=()):
+    message = SimpleNamespace(content=content, tool_calls=list(tool_calls) or None)
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def tool_call(id, name, arguments):
+    return SimpleNamespace(id=id, function=SimpleNamespace(name=name, arguments=arguments))
+
+
 def png_bytes(color=(52, 101, 164), size=(64, 64), mode="RGB") -> bytes:
     buffer = io.BytesIO()
     Image.new(mode, size, color).save(buffer, format="PNG")
@@ -73,6 +95,6 @@ def fake_embedder():
 def client(fake_embedder):
     app.dependency_overrides[get_embedder] = lambda: fake_embedder
     app.dependency_overrides[get_settings] = lambda: Settings()
-    app.dependency_overrides[get_anthropic_client] = lambda: None
+    app.dependency_overrides[get_stylist] = lambda: None
     yield TestClient(app)
     app.dependency_overrides.clear()

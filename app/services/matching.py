@@ -117,7 +117,8 @@ def match(request: MatchRequest) -> MatchResponse:
         reasons.append("Nothing in your closet to pair it with yet.")
     else:
         reasons.append(f"Goes well with {good_partners} of {len(partners)} matching pieces.")
-        reasons.append(f"Creates {outfit_count} complete outfits with what you own.")
+        noun = "outfit" if outfit_count == 1 else "outfits"
+        reasons.append(f"Creates {outfit_count} complete {noun} with what you own.")
     if similar:
         names = ", ".join(p.name for p in similar[:3])
         reasons.append(f"You already own something very similar: {names}.")

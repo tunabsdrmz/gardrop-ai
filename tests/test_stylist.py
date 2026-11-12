@@ -1,7 +1,22 @@
+import json
+
+from app.config import Settings
 from app.main import app
 from app.schemas import ClosetItem, StylistRequest, Weather
-from app.services.stylist import get_anthropic_client, run_stylist
-from tests.conftest import FakeAnthropic, reply, text_block, tool_block
+from app.services.stylist import (
+    AnthropicStylist,
+    OpenAICompatibleStylist,
+    get_stylist,
+)
+from tests.conftest import (
+    FakeAnthropic,
+    FakeOpenAI,
+    chat_reply,
+    reply,
+    text_block,
+    tool_block,
+    tool_call,
+)
 
 REQUEST = StylistRequest(
     message="What should I wear to a wedding on Saturday?",
@@ -14,26 +29,62 @@ REQUEST = StylistRequest(
     weather=Weather(city="Ankara", temperature=12, low=6, condition="cloudy"),
 )
 
+OUTFIT = {"title": "Wedding guest", "item_ids": ["dress-1", "heels-1"],
+          "reason": "Elegant and warm enough."}
 
-def test_stylist_uses_tools_then_answers():
-    fake = FakeAnthropic([
-        reply(tool_block("t1", "get_closet", {}), tool_block("t2", "get_weather", {}),
-              stop_reason="tool_use"),
-        reply(tool_block("t3", "suggest_outfit", {"title": "Wedding guest",
-                                                  "item_ids": ["dress-1", "heels-1"],
-                                                  "reason": "Elegant and warm enough."}),
-              stop_reason="tool_use"),
-        reply(text_block("Your burgundy dress is perfect for it.")),
+
+# MARK: - OpenAI-compatible (Ollama, Groq, Gemini)
+
+
+def test_openai_stylist_uses_tools_then_answers():
+    fake = FakeOpenAI([
+        chat_reply(tool_calls=[tool_call("c1", "get_closet", "{}"),
+                               tool_call("c2", "get_weather", "{}")]),
+        chat_reply(tool_calls=[tool_call("c3", "suggest_outfit", json.dumps(OUTFIT))]),
+        chat_reply(content="Your burgundy dress is perfect for it."),
     ])
 
-    result = run_stylist(REQUEST, fake, "test-model")
+    result = OpenAICompatibleStylist(fake, "test-model").run(REQUEST)
 
     assert result.reply == "Your burgundy dress is perfect for it."
     assert result.outfits[0].item_ids == ["dress-1", "heels-1"]
-    # The closet was sent back to Claude as a tool result.
+    sent = fake.calls[1]["messages"]
+    assert sent[0]["role"] == "system"
+    tool_messages = [m for m in sent if m["role"] == "tool"]
+    assert "Burgundy dress" in tool_messages[0]["content"]
+    assert "Ankara" in tool_messages[1]["content"]
+
+
+def test_openai_stylist_survives_broken_tool_arguments():
+    fake = FakeOpenAI([
+        chat_reply(tool_calls=[tool_call("c1", "suggest_outfit", "{not json")]),
+        chat_reply(content="Let me try again later."),
+    ])
+
+    result = OpenAICompatibleStylist(fake, "test-model").run(REQUEST)
+
+    assert result.outfits == []
+    tool_message = fake.calls[1]["messages"][-1]
+    assert "not valid JSON" in tool_message["content"]
+
+
+# MARK: - Anthropic
+
+
+def test_anthropic_stylist_uses_tools_then_answers():
+    fake = FakeAnthropic([
+        reply(tool_block("t1", "get_closet", {}), tool_block("t2", "get_weather", {}),
+              stop_reason="tool_use"),
+        reply(tool_block("t3", "suggest_outfit", OUTFIT), stop_reason="tool_use"),
+        reply(text_block("Your burgundy dress is perfect for it.")),
+    ])
+
+    result = AnthropicStylist(fake, "test-model").run(REQUEST)
+
+    assert result.reply == "Your burgundy dress is perfect for it."
+    assert result.outfits[0].item_ids == ["dress-1", "heels-1"]
     first_results = fake.calls[1]["messages"][-1]["content"]
     assert "Burgundy dress" in first_results[0]["content"]
-    assert "Ankara" in first_results[1]["content"]
 
 
 def test_unknown_item_ids_are_reported_back_as_errors():
@@ -43,25 +94,43 @@ def test_unknown_item_ids_are_reported_back_as_errors():
         reply(text_block("Sorry, let me check your closet.")),
     ])
 
-    result = run_stylist(REQUEST, fake, "test-model")
+    result = AnthropicStylist(fake, "test-model").run(REQUEST)
 
     assert result.outfits == []
-    tool_result = fake.calls[1]["messages"][-1]["content"][0]
-    assert tool_result["is_error"] is True
+    assert fake.calls[1]["messages"][-1]["content"][0]["is_error"] is True
 
 
-def test_stylist_returns_503_without_api_key(client):
-    body = {"message": "Hi", "closet": []}
+# MARK: - Configuration and endpoint
 
-    assert client.post("/stylist", json=body).status_code == 503
+
+def test_get_stylist_picks_the_backend():
+    assert isinstance(get_stylist(Settings(stylist_provider="ollama")), OpenAICompatibleStylist)
+    assert get_stylist(Settings(stylist_provider="gemini", gemini_api_key=None)) is None
+    claude = get_stylist(Settings(stylist_provider="anthropic", anthropic_api_key="k"))
+    assert isinstance(claude, AnthropicStylist)
+    assert claude.model == "claude-haiku-5-5"
+
+
+def test_stylist_returns_503_when_not_configured(client):
+    assert client.post("/stylist", json={"message": "Hi", "closet": []}).status_code == 503
 
 
 def test_stylist_endpoint(client):
-    app.dependency_overrides[get_anthropic_client] = lambda: FakeAnthropic(
-        [reply(text_block("Try your burgundy dress."))]
-    )
+    fake = FakeOpenAI([chat_reply(content="Try your burgundy dress.")])
+    app.dependency_overrides[get_stylist] = lambda: OpenAICompatibleStylist(fake, "m")
     body = {"message": "Wedding?", "closet": [c.model_dump() for c in REQUEST.closet]}
     response = client.post("/stylist", json=body)
 
     assert response.status_code == 200
     assert response.json()["reply"] == "Try your burgundy dress."
+
+
+def test_stylist_returns_502_when_the_model_is_down(client):
+    class Down:
+        def run(self, request):
+            raise ConnectionError("Ollama is not running")
+
+    app.dependency_overrides[get_stylist] = lambda: Down()
+    response = client.post("/stylist", json={"message": "Hi", "closet": []})
+
+    assert response.status_code == 502

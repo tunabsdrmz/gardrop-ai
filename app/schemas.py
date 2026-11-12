@@ -14,6 +14,7 @@ Formality = Literal["sporty", "casual", "smart-casual", "formal"]
 class HealthResponse(BaseModel):
     status: str
     version: str
+    stylist_provider: str
     stylist_enabled: bool
     clip_loaded: bool
 

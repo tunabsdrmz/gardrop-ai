@@ -1,15 +1,21 @@
-"""AI stylist: Claude with tool use.
+"""AI stylist: an LLM with tool use.
 
-Claude can't see the closet directly. It asks for it by calling our tools
+The model can't see the closet directly. It asks for it by calling our tools
 (get_closet, get_weather), and shows outfits by calling suggest_outfit.
-We run the tools, send the results back, and repeat until Claude answers.
+We run the tools, send the results back, and repeat until the model answers.
+
+Two backends share the same tools and rules:
+- OpenAICompatibleStylist: Ollama (local, free), Groq and Gemini
+- AnthropicStylist: Claude
 """
 
 import json
 from functools import lru_cache
-from typing import Any
+from typing import Annotated, Any, Protocol
 
-from app.config import get_settings
+from fastapi import Depends
+
+from app.config import Settings, get_settings
 from app.schemas import StylistRequest, StylistResponse, SuggestedOutfit
 
 SYSTEM_PROMPT = """You are the personal stylist inside Gardrop, a wardrobe app.
@@ -19,6 +25,7 @@ SYSTEM_PROMPT = """You are the personal stylist inside Gardrop, a wardrobe app.
 - Keep your reply short: 2-4 warm, specific sentences. No lists of item ids in the text.
 - Reply in the same language as the user's latest message."""
 
+# Tool definitions, written once. Each backend converts them to its own format.
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "get_closet",
@@ -55,12 +62,17 @@ TOOLS: list[dict[str, Any]] = [
 
 MAX_TURNS = 6
 MAX_OUTFITS = 3
+FALLBACK_REPLY = "Here are my picks for you."
 
 
-def _run_tool(
+class Stylist(Protocol):
+    def run(self, request: StylistRequest) -> StylistResponse: ...
+
+
+def run_tool(
     name: str, arguments: dict[str, Any], request: StylistRequest, outfits: list[SuggestedOutfit]
 ) -> tuple[Any, bool]:
-    """Executes one tool call. Returns (result, is_error)."""
+    """Executes one tool call. Returns (result, is_error). Shared by every backend."""
     if name == "get_closet":
         category = arguments.get("category")
         items = [i for i in request.closet if category is None or i.category == category]
@@ -91,52 +103,166 @@ def _run_tool(
     return {"error": f"Unknown tool: {name}"}, True
 
 
-def run_stylist(request: StylistRequest, client: Any, model: str) -> StylistResponse:
-    messages: list[dict[str, Any]] = [
-        {"role": m.role, "content": m.content} for m in request.history[-10:]
-    ]
+def _history(request: StylistRequest) -> list[dict[str, Any]]:
+    """The last 10 messages plus the new one; older ones only add cost."""
+    messages = [{"role": m.role, "content": m.content} for m in request.history[-10:]]
     messages.append({"role": "user", "content": request.message})
-    outfits: list[SuggestedOutfit] = []
+    return messages
 
-    for _ in range(MAX_TURNS):
-        response = client.messages.create(
-            model=model,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
-        )
-        messages.append({"role": "assistant", "content": response.content})
 
-        if response.stop_reason != "tool_use":
-            reply = "".join(b.text for b in response.content if b.type == "text").strip()
-            return StylistResponse(reply=reply, outfits=outfits)
+class OpenAICompatibleStylist:
+    """Ollama, Groq and Gemini all speak the OpenAI chat format."""
 
-        results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-            output, is_error = _run_tool(block.name, block.input, request, outfits)
-            results.append(
+    def __init__(self, client: Any, model: str) -> None:
+        self.client = client
+        self.model = model
+
+    @staticmethod
+    def _tools() -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t["input_schema"],
+                },
+            }
+            for t in TOOLS
+        ]
+
+    def run(self, request: StylistRequest) -> StylistResponse:
+        messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages += _history(request)
+        outfits: list[SuggestedOutfit] = []
+
+        for _ in range(MAX_TURNS):
+            response = self.client.chat.completions.create(
+                model=self.model, messages=messages, tools=self._tools()
+            )
+            message = response.choices[0].message
+            calls = message.tool_calls or []
+
+            if not calls:
+                return StylistResponse(reply=(message.content or "").strip(), outfits=outfits)
+
+            messages.append(
                 {
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": json.dumps(output, ensure_ascii=False),
-                    "is_error": is_error,
+                    "role": "assistant",
+                    "content": message.content or "",
+                    "tool_calls": [
+                        {
+                            "id": c.id,
+                            "type": "function",
+                            "function": {
+                                "name": c.function.name,
+                                "arguments": c.function.arguments,
+                            },
+                        }
+                        for c in calls
+                    ],
                 }
             )
-        messages.append({"role": "user", "content": results})
+            for call in calls:
+                try:
+                    arguments = json.loads(call.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    output = {"error": "Tool arguments were not valid JSON. Try again."}
+                else:
+                    output, _ = run_tool(call.function.name, arguments, request, outfits)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": json.dumps(output, ensure_ascii=False),
+                    }
+                )
 
-    # Claude kept calling tools; return what we have instead of looping forever.
-    return StylistResponse(reply="Here are my picks for you.", outfits=outfits)
+        return StylistResponse(reply=FALLBACK_REPLY, outfits=outfits)
+
+
+class AnthropicStylist:
+    """Claude's native tool-use format."""
+
+    def __init__(self, client: Any, model: str) -> None:
+        self.client = client
+        self.model = model
+
+    def run(self, request: StylistRequest) -> StylistResponse:
+        messages = _history(request)
+        outfits: list[SuggestedOutfit] = []
+
+        for _ in range(MAX_TURNS):
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=1024,
+                system=SYSTEM_PROMPT,
+                tools=TOOLS,
+                messages=messages,
+            )
+            messages.append({"role": "assistant", "content": response.content})
+
+            if response.stop_reason != "tool_use":
+                reply = "".join(b.text for b in response.content if b.type == "text").strip()
+                return StylistResponse(reply=reply, outfits=outfits)
+
+            results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                output, is_error = run_tool(block.name, block.input, request, outfits)
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps(output, ensure_ascii=False),
+                        "is_error": is_error,
+                    }
+                )
+            messages.append({"role": "user", "content": results})
+
+        return StylistResponse(reply=FALLBACK_REPLY, outfits=outfits)
+
+
+# MARK: - Clients
+
+PROVIDER_BASE_URLS = {
+    "groq": "https://api.groq.com/openai/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+}
 
 
 @lru_cache
-def get_anthropic_client() -> Any | None:
-    """None when no API key is configured; the endpoint then answers 503."""
-    settings = get_settings()
-    if not settings.anthropic_api_key:
-        return None
+def _openai_client(base_url: str, api_key: str) -> Any:
+    from openai import OpenAI
+
+    return OpenAI(base_url=base_url, api_key=api_key, timeout=60)
+
+
+@lru_cache
+def _anthropic_client(api_key: str) -> Any:
     import anthropic
 
-    return anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    return anthropic.Anthropic(api_key=api_key)
+
+
+def get_stylist(settings: Annotated[Settings, Depends(get_settings)]) -> Stylist | None:
+    """Builds the stylist for the configured provider, or None when a key is missing."""
+    if not settings.stylist_configured:
+        return None
+    model = settings.resolved_stylist_model
+
+    match settings.stylist_provider:
+        case "ollama":
+            # Ollama ignores the key, but the client needs a non-empty one.
+            client = _openai_client(settings.ollama_base_url, "ollama")
+            return OpenAICompatibleStylist(client, model)
+        case "groq":
+            client = _openai_client(PROVIDER_BASE_URLS["groq"], settings.groq_api_key or "")
+            return OpenAICompatibleStylist(client, model)
+        case "gemini":
+            client = _openai_client(PROVIDER_BASE_URLS["gemini"], settings.gemini_api_key or "")
+            return OpenAICompatibleStylist(client, model)
+        case "anthropic":
+            return AnthropicStylist(_anthropic_client(settings.anthropic_api_key or ""), model)
+    return None

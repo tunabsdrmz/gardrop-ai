@@ -18,6 +18,7 @@ def health(
     return HealthResponse(
         status="ok",
         version=settings.version,
-        stylist_enabled=settings.anthropic_api_key is not None,
+        stylist_provider=settings.stylist_provider,
+        stylist_enabled=settings.stylist_configured,
         clip_loaded=embedder.loaded,
     )
